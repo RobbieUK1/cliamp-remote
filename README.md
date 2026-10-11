@@ -56,7 +56,7 @@ drops every widget that is not in them, which silently removes this one.
 `ensure-bar.sh` puts it back. Wire it up with a systemd path unit that watches
 `shell.json`:
 
-`~/.config/systemd/user/omarchy-cliamp-bar.path`
+`~/.config/systemd/user/cliamp-remote-bar.path`
 
 ```ini
 [Unit]
@@ -64,13 +64,13 @@ Description=Watch shell.json and keep the Cliamp bar widget present
 
 [Path]
 PathChanged=%h/.config/omarchy/shell.json
-Unit=omarchy-cliamp-bar.service
+Unit=cliamp-remote-bar.service
 
 [Install]
 WantedBy=default.target
 ```
 
-`~/.config/systemd/user/omarchy-cliamp-bar.service`
+`~/.config/systemd/user/cliamp-remote-bar.service`
 
 ```ini
 [Unit]
@@ -83,7 +83,7 @@ ExecStart=%h/.config/omarchy/plugins/robbie.cliamp/ensure-bar.sh
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now omarchy-cliamp-bar.path
+systemctl --user enable --now cliamp-remote-bar.path
 ```
 
 The script re-adds the widget only when the removal came from a refresh — it

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Re-adds the robbie.cliamp bar widget after "omarchy refresh shell" wipes it
-# from shell.json. Triggered by the omarchy-cliamp-bar.path systemd user unit
+# from shell.json. Triggered by the cliamp-remote-bar.path systemd user unit
 # on every shell.json write.
 #
 # A refresh is detected by the shell.json.bak.<epoch> backup that
