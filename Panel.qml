@@ -18,6 +18,18 @@ import qs.Ui
 // cliamp's raw IPC output itself. The socket is watched with a FileView, so
 // the widget wakes up the moment cliamp starts or stops; a slow poll timer
 // is the fallback and drives the fast poll while cliamp is active.
+//
+// No cliamp window is needed: when nothing is running, the helper starts
+// cliamp headless (`cliamp --daemon`) and the widget controls it over the
+// same socket.
+//
+// The dropdown follows the system theme, and its card surface obeys the
+// system window transparency: the alpha tracks the robbie.transparency
+// slider via looknfeel.lua's default-opacity rule (see ThemedKeyboardPanel).
+// While the dropdown is open during playback, a spectrum analyser fed by
+// `cliamp visstream` dances above the station name; the station is shown
+// under the title its list entry uses (default list / favourites / search),
+// not the raw stream name or URL.
 Panel {
   id: root
   moduleName: "robbie.cliamp"
@@ -27,20 +39,64 @@ Panel {
   readonly property string scriptPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/robbie.cliamp/cliamp.py"
   readonly property string socketPath: Quickshell.env("HOME") + "/.config/cliamp/cliamp.sock"
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  // The dropdown paints on a vendored copy of the shared popup card
+  // (ThemedKeyboardPanel) so its surface can obey the system transparency:
+  // the card colour is the themed popup background with its alpha scaled by
+  // the live window-opacity rule from robbie.transparency (looknfeel.lua's
+  // default-opacity tag), matching how robbie.cpu-temp-compact's popup
+  // behaves. Content uses the popup text token, not the bar's — the bar
+  // tokens are contrast-matched to the bar face (and to the wallpaper when
+  // the bar is transparent), which is the wrong reference for a popup card.
+  property real windowOpacity: 1
+  readonly property color popupBackground: Qt.rgba(
+    Color.popups.background.r, Color.popups.background.g,
+    Color.popups.background.b, Color.popups.background.a * root.windowOpacity)
+  readonly property color foreground: Color.popups.text
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property color accent: Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Follow the live default-opacity rule, including manual changes from the
+  // transparency slider or direct looknfeel.lua edits.
+  FileView {
+    id: transparencyFile
+    path: Quickshell.env("HOME") + "/.config/hypr/looknfeel.lua"
+    printErrors: false
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: {
+      var match = text().match(/tag\s*=\s*"default-opacity"\s*\}\s*,\s*\{\s*opacity\s*=\s*"([0-9.]+)/)
+      root.windowOpacity = match && isFinite(Number(match[1])) ? Math.max(0, Math.min(1, Number(match[1]))) : 1
+    }
+    onLoadFailed: root.windowOpacity = 1
+  }
+
   // Runtime snapshot, refreshed by pollTimer / socket watcher.
   property bool running: false
   property string pState: "stopped" // "playing" | "paused" | "stopped"
-  property string currentTitle: ""
+  property string currentTitle: "" // cliamp's logical track title (fallback)
   property string currentPath: ""
 
-  // Set when a station is picked while cliamp is stopped. The URL is played
-  // as soon as the player socket appears (see applyPoll / launchTimer).
+  // Display names for the now-playing block. stationName is the title the
+  // station lists know the stream by (default list / favourites / search),
+  // falling back to cliamp's own title when the stream is unknown. detail
+  // carries the ICY now-playing song when the stream reports one, otherwise
+  // the stream URL.
+  property string stationName: ""
+  property string nowDetail: ""
+  property string icyTitle: ""
+  property string icyArtist: ""
+
+  // Spectrum analyser feed (cliamp visstream NDJSON), consumed only while
+  // the dropdown is open and playback is running.
+  property var spectrumBands: []
+  property bool visSuppressed: false
+
+  // Set when a station or a control is used while cliamp is stopped. The
+  // helper starts the headless daemon; the queued action runs as soon as the
+  // player socket appears (see applyPoll / launchTimer).
   property string pendingPlayUrl: ""
+  property string pendingControl: ""
   property bool launcherArmed: false
 
   // The station sources. `default` comes from cliamp's streams.m3u,
@@ -51,6 +107,11 @@ Panel {
   property var searchResults: []
   property string stationSource: "default"
   property bool searching: false
+  // Last station payload seen in a poll, as JSON: lets applyPoll skip the
+  // delegate-destroying rebuild when nothing changed (poll fires every
+  // 2.5 s while playing, so rebuilding unconditionally would churn the
+  // station Repeater continuously).
+  property string lastStationsJson: ""
 
   // Keyboard-cursor state over the active station list.
   property var stRows: []
@@ -68,6 +129,35 @@ Panel {
     for (var i = 0; i < root.favorites.length; i++)
       if (root.favorites[i].url === url) return true
     return false
+  }
+
+  // The name the station lists know a stream by (default list, favourites,
+  // search results), matched on the exact URL. Empty when unknown.
+  function stationNameFor(url) {
+    if (!url) return ""
+    var lists = [root.defaultStations, root.favorites, root.searchResults]
+    for (var l = 0; l < lists.length; l++) {
+      var src = lists[l]
+      for (var i = 0; i < src.length; i++)
+        if (src[i].url === url) return String(src[i].title || "")
+    }
+    return ""
+  }
+
+  // Refresh the now-playing display names: prefer the list title over
+  // cliamp's stream name, and show the ICY now-playing song (when the
+  // stream reports one that is not just the station name) in the detail
+  // line instead of the raw stream URL.
+  function updateNowDisplay() {
+    var listed = root.stationNameFor(root.currentPath)
+    root.stationName = listed !== "" ? listed : root.currentTitle
+    var song = ""
+    if (root.icyTitle !== "" && root.icyTitle !== root.stationName) {
+      song = root.icyTitle
+      if (root.icyArtist !== "" && root.icyTitle.indexOf(root.icyArtist) !== 0)
+        song = root.icyArtist + " - " + root.icyTitle
+    }
+    root.nowDetail = song !== "" ? song : root.currentPath
   }
 
   function stationRows() {
@@ -88,6 +178,7 @@ Panel {
   function rebuildStations() {
     root.stRows = root.stationRows()
     if (root.cursorIndex >= root.stRows.length) root.cursorIndex = Math.max(0, root.stRows.length - 1)
+    root.updateNowDisplay()
     Qt.callLater(revealRow)
   }
 
@@ -133,21 +224,38 @@ Panel {
   function applyPoll(raw) {
     var d = {}
     try { d = JSON.parse(raw) } catch (e) { d = {} }
+    var oldPath = root.currentPath
+    var newPath = String(d.path || "")
+    // The helper always includes `stations`; compare as JSON so we only
+    // rebuild the row delegates (and re-reveal the cursor) when the lists
+    // or the active station actually changed.
+    var stationsJson = d.stations ? JSON.stringify(d.stations) : ""
+    var stationsChanged = stationsJson !== "" && stationsJson !== root.lastStationsJson
     root.running = !!d.running
     root.pState = String(d.state || "stopped")
     root.currentTitle = String(d.title || "")
-    root.currentPath = String(d.path || "")
+    root.currentPath = newPath
+    root.icyTitle = String(d.track_title || "")
+    root.icyArtist = String(d.track_artist || "")
+    root.updateNowDisplay()
     if (root.running && root.pendingPlayUrl !== "") {
       var queued = root.pendingPlayUrl
       root.pendingPlayUrl = ""
+      root.pendingControl = ""
       root.launcherArmed = false
       root.playStation(queued)
+    } else if (root.running && root.pendingControl !== "") {
+      var queuedCtrl = root.pendingControl
+      root.pendingControl = ""
+      root.launcherArmed = false
+      root.doControl(queuedCtrl)
     }
-    if (d.stations) {
+    if (stationsChanged) {
+      root.lastStationsJson = stationsJson
       if (d.stations.default) root.defaultStations = d.stations.default
       if (d.stations.favorites) root.favorites = d.stations.favorites
     }
-    root.rebuildStations()
+    if (stationsChanged || newPath !== oldPath) root.rebuildStations()
   }
 
   function runSearch() {
@@ -186,10 +294,42 @@ Panel {
   }
 
   function doControl(cmd) {
-    if (!root.running) return
-    ctrlProc.command = ["python3", root.scriptPath, "raw", cmd]
-    ctrlProc.running = false
-    ctrlProc.running = true
+    if (root.running) {
+      ctrlProc.command = ["python3", root.scriptPath, "raw", cmd]
+      ctrlProc.running = false
+      ctrlProc.running = true
+      return
+    }
+    // Nothing is running. Lazy-start the headless daemon and apply the
+    // control once it is up. Only play/pause makes sense without a player;
+    // prev/next stay gated in the UI.
+    if (cmd !== "toggle") return
+    root.pendingControl = cmd
+    root.ensureStarted()
+  }
+
+  // Start cliamp headless (no window) when nothing is running. The queued
+  // action (pendingPlayUrl / pendingControl) is applied by applyPoll as soon
+  // as the IPC socket appears; launchTimer gives up after a while.
+  function ensureStarted() {
+    if (root.launcherArmed) return
+    root.launcherArmed = true
+    launchTimer.restart()
+    launchProc.command = ["python3", root.scriptPath, "start"]
+    launchProc.running = false
+    launchProc.running = true
+  }
+
+  // Hand playback over to a cliamp TUI window, in sync with the player: the
+  // helper snapshots the live stream, stops the headless daemon (one socket
+  // owner only), and launches the terminal UI on the same stream — playing
+  // and seeked when the daemon was playing, loaded when it was paused.
+  function openWindow() {
+    if (openProc.running) return
+    openProc.command = ["python3", root.scriptPath, "open"]
+    openProc.running = false
+    openProc.running = true
+    root.close()
   }
 
   function playStation(url) {
@@ -202,12 +342,7 @@ Panel {
       return
     }
     root.pendingPlayUrl = url
-    if (root.launcherArmed) return
-    root.launcherArmed = true
-    launchTimer.restart()
-    launchProc.command = ["omarchy-launch-or-focus-tui", "cliamp"]
-    launchProc.running = false
-    launchProc.running = true
+    root.ensureStarted()
   }
 
   function toggleFavorite(url, title) {
@@ -231,7 +366,8 @@ Panel {
   }
 
   function barTooltip() {
-    if (root.currentTitle !== "") return "Cliamp · " + root.currentTitle
+    var name = root.stationName !== "" ? root.stationName : root.currentTitle
+    if (name !== "") return "Cliamp · " + name
     return "Cliamp"
   }
 
@@ -274,6 +410,21 @@ Panel {
   Process {
     id: launchProc
     running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.refresh()
+    }
+    onExited: function(code, status) {
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: openProc
+    running: false
+    onExited: function(code, status) {
+      root.refresh()
+    }
   }
 
   Timer {
@@ -283,6 +434,7 @@ Panel {
     onTriggered: {
       root.launcherArmed = false
       root.pendingPlayUrl = ""
+      root.pendingControl = ""
     }
   }
 
@@ -292,6 +444,41 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyFavorite(text)
+    }
+  }
+
+  // Spectrum feed: cliamp's `visstream` streams one NDJSON frame per line
+  // ({"ok":true,"bands":[0..1,...]}). It only runs while the dropdown is
+  // open and playback is running, so an idle widget costs nothing. The
+  // stream rides on the same IPC socket, so it works headless too.
+  Process {
+    id: visProc
+    running: root.opened && root.pState === "playing" && !root.visSuppressed
+    command: ["cliamp", "visstream", "--fps", "15"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (!line || line.length > 65536) return
+        try {
+          var d = JSON.parse(String(line))
+          if (d && d.ok) root.spectrumBands = Array.isArray(d.bands) ? d.bands : []
+        } catch (e) { }
+      }
+    }
+    onExited: function(code, status) {
+      root.spectrumBands = []
+      if (root.opened && root.pState === "playing") visRetryTimer.restart()
+    }
+  }
+
+  // Restart the feed after an unexpected drop (e.g. the daemon died and a
+  // poll has not re-evaluated the running binding yet).
+  Timer {
+    id: visRetryTimer
+    interval: 1000
+    repeat: false
+    onTriggered: {
+      root.visSuppressed = true
+      Qt.callLater(function() { root.visSuppressed = false })
     }
   }
 
@@ -358,13 +545,14 @@ Panel {
     }
   }
 
-  KeyboardPanel {
+  ThemedKeyboardPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
+    backgroundColor: root.popupBackground
     contentWidth: panel.fittedContentWidth(Style.space(340))
     contentHeight: panel.cappedContentHeight(Style.space(520))
 
@@ -384,6 +572,13 @@ Panel {
         width: parent.width
         height: parent.height
         spacing: 0
+
+        // ---- top spacing
+        Item {
+          id: topPad
+          width: parent.width
+          height: Style.space(10)
+        }
 
         // ---- header
         Item {
@@ -461,9 +656,8 @@ Panel {
                   horizontalPadding: Style.spacing.panelGap
                   verticalPadding: Style.spacing.controlPaddingY
                   iconSize: Style.font.iconLarge
-                  enabled: root.running
-                  opacity: enabled ? 1.0 : 0.35
-                  tooltipText: "Play / Pause"
+                  enabled: true
+                  tooltipText: root.running ? "Play / Pause" : "Start cliamp"
                   onClicked: root.doControl("toggle")
                 }
 
@@ -498,16 +692,41 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(12)
             anchors.rightMargin: Style.space(12)
-            spacing: Style.space(1)
+            spacing: Style.space(3)
+
+            // Spectrum analyser above the station name; fed by visstream and
+            // only present while playback runs (see visProc).
+            Item {
+              id: spectrumBox
+              width: parent.width
+              height: visible ? Style.space(16) : 0
+              visible: root.spectrumBands.length > 0
+
+              Repeater {
+                model: root.spectrumBands.length > 0 ? root.spectrumBands : []
+
+                delegate: Rectangle {
+                  required property var modelData
+                  required property int index
+                  x: index * (spectrumBox.width / root.spectrumBands.length)
+                  width: Math.max(1, spectrumBox.width / root.spectrumBands.length - Style.space(2))
+                  height: Math.max(Style.space(1), Math.min(1, Number(modelData) || 0) * spectrumBox.height)
+                  anchors.bottom: parent.bottom
+                  color: root.accent
+                  opacity: 0.85
+                  Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+                }
+              }
+            }
 
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: root.currentTitle !== "" ? root.currentTitle : "Nothing playing yet"
+              text: root.stationName !== "" ? root.stationName : "Nothing playing yet"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
-              font.bold: root.currentTitle !== ""
+              font.bold: root.stationName !== ""
               elide: Text.ElideRight
               visible: text !== ""
             }
@@ -515,7 +734,7 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: root.currentPath !== "" ? root.currentPath : "Pick a station below"
+              text: root.nowDetail !== "" ? root.nowDetail : "Pick a station below"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -635,7 +854,7 @@ Panel {
         Flickable {
           id: stScroll
           width: parent.width
-          height: column.height - headerBox.height - nowBox.height
+          height: column.height - topPad.height - headerBox.height - nowBox.height
             - searchBox.height - chipsBox.height - footerBox.height - Style.space(2)
           clip: true
           contentWidth: width
@@ -792,22 +1011,61 @@ Panel {
         Item {
           id: footerBox
           width: parent.width
-          height: footerLabel.implicitHeight + Style.space(8)
+          height: footerColumn.implicitHeight + Style.space(8)
 
-          Text {
-            id: footerLabel
+          Column {
+            id: footerColumn
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(12)
             anchors.rightMargin: Style.space(12)
-            horizontalAlignment: Text.AlignHCenter
-            textFormat: Text.PlainText
-            text: "Click a row to play · bookmark toggles favourites · Esc closes"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            spacing: Style.space(2)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                id: footerLabel
+                width: parent.width - openCliampBtn.width - parent.spacing
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "Click a row to play · bookmark toggles favourites · Esc closes"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              Button {
+                id: openCliampBtn
+                text: "Open Cliamp"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.spacing.controlPaddingX + 4
+                verticalPadding: Style.spacing.controlPaddingY
+                tooltipText: "Open the Cliamp window"
+                onClicked: root.openWindow()
+              }
+            }
+
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              textFormat: Text.StyledText
+              text: "<a href=\"https://github.com/bjarneo/cliamp\">Cliamp player by bjarneo · cliamp.stream</a>"
+              color: root.foreground
+              linkColor: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              onLinkActivated: function(link) {
+                Quickshell.execDetached(["/usr/bin/xdg-open", link])
+              }
+              elide: Text.ElideRight
+            }
           }
         }
       }
